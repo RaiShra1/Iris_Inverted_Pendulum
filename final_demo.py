@@ -40,12 +40,16 @@ class OffbPosCtl:
 		self.curr_drone_pose = PoseStamped()
 		self.curr_drone_vel = TwistStamped()
 		self.is_ready_to_fly = False
-		self.hover_loc = [-2.29, -2.28, 3, 0, 0, 0, 0] # Hovers 3meter above at this location
+		self.hover_loc = [3.0,0.0, 3, 0, 0, 0, 0] # Hovers 3meter above at this location
 		self.dist_threshold = 0.1
 		self.arm = False
 
 		self.pole_pose = 0
 		self.pole_vel = 0
+
+		self.locations = np.matrix([[0.0, 0.0, 3.0, 0, 0, 0, 0],
+							  [0.0, 01.0, 03.0, 0, 0, 0, 0],
+							  [0.0, 02.0, 03.0, 0, 0, 0, 0],])
 
 
 	def drone_pose_cb(self, msg):
@@ -75,6 +79,14 @@ class OffbPosCtl:
 		try:
 			flightModeService = rospy.ServiceProxy('/mavros/set_mode', SetMode)
 			isModeChanged = flightModeService(custom_mode='OFFBOARD')
+		except rospy.ServiceException as e:
+			print("service set_mode call failed: %s. OFFBOARD Mode could not be set. Check that GPS is enabled" % e)
+
+	def set_autoland_mode(self):
+		rospy.wait_for_service('/mavros/set_mode')
+		try:
+			flightModeService = rospy.ServiceProxy('/mavros/set_mode', SetMode)
+			isModeChanged = flightModeService(custom_mode='AUTO.LAND')
 		except rospy.ServiceException as e:
 			print("service set_mode call failed: %s. OFFBOARD Mode could not be set. Check that GPS is enabled" % e)
 
@@ -123,31 +135,31 @@ class OffbPosCtl:
 		#print("Position", self.x, " ",self.y, " ",self.z)
 		att_rate_x = np.dot(-self.Kx, np.array([self.x_diff, self.xdot, self.roll, self.r, self.rdot]))
 		att_rate_y = np.dot(-self.Ky, np.array([self.y_diff, self.ydot, self.pitch, self.s, self.sdot]))
-		a = np.dot(-self.Kz, np.array([self.z_diff, self.zdot])) + G
+		a = np.dot(-self.Kz, np.array([self.z_diff, self.zdot])) - G
 
 		print("x =", att_rate_x, "y =", att_rate_y, "a=",a)
 		return att_rate_x, att_rate_y, a
 
 
 
-	def goToPosition(self, pos):
+	def goToPosition(self):
 		""" hover at height mentioned in location
 			set mode as HOVER to make it work
 		"""
-		location = pos
+		index=0
 		rate = rospy.Rate(20)
 		des_pose = PoseStamped()
 		#print(self.mode)
 		while not rospy.is_shutdown():
 			self.set_arm()
 			self.set_offboard_mode()
-			des_pose.pose.position.x = location[0]
-			des_pose.pose.position.y = location[1]
-			des_pose.pose.position.z = location[2]
-			des_pose.pose.orientation.x = location[3]
-			des_pose.pose.orientation.y = location[4]
-			des_pose.pose.orientation.z = location[5]
-			des_pose.pose.orientation.w = location[6]
+			des_pose.pose.position.x = self.locations[index, 0]
+			des_pose.pose.position.y = self.locations[index, 1]
+			des_pose.pose.position.z = self.locations[index, 2]
+			des_pose.pose.orientation.x = self.locations[index, 3]
+			des_pose.pose.orientation.y = self.locations[index, 4]
+			des_pose.pose.orientation.z = self.locations[index, 5]
+			des_pose.pose.orientation.w = self.locations[index, 6]
 
 			curr_x = self.curr_drone_pose.pose.position.x
 			curr_y = self.curr_drone_pose.pose.position.y
@@ -159,35 +171,37 @@ class OffbPosCtl:
 
 			dist = math.sqrt((curr_x - des_x)*(curr_x - des_x) + (curr_y - des_y)*(curr_y - des_y) + (curr_z - des_z)*(curr_z - des_z))
 
-			if dist < 0.5:
-				break
-
 			self.drone_pose_pub.publish(des_pose)
+			if dist < 0.5:
+				#index+=1
+				if index > 2:
+					index = 2
+				self.attitudeControl(curr_x, curr_y, curr_z, des_x, des_y, des_z)
 
-			#######LQR########
-			self.statefeedback()
-			self.x_diff = curr_x - des_x
-			self.y_diff = curr_y - des_y
-			self.z_diff = curr_z - des_z
-			x,y,a = self.LQR()
-			self.att_cmd.type_mask = 128
-			self.att_cmd.header.frame_id = "base_footprint"  
-			self.att_cmd.body_rate.x = x
-			self.att_cmd.body_rate.y = y
-			# if self.pole_pose < 0:
-			# 	self.att_cmd.body_rate.y = -0.1
-			# else:
-			# 	self.att_cmd.body_rate.y = 0.1
-			self.att_cmd.body_rate.z = 0
-			self.att_cmd.thrust = 0.55
-			self.drone_att_pub.publish(self.att_cmd)
 			rate.sleep()
+
+	def attitudeControl(self, curr_x, curr_y, curr_z, des_x, des_y, des_z):
+		self.statefeedback()
+		self.x_diff = curr_x - des_x
+		self.y_diff = curr_y - des_y
+		self.z_diff = curr_z - des_z
+		x,y,a = self.LQR()
+		self.att_cmd.type_mask = 128
+		self.att_cmd.header.frame_id = "base_footprint"  
+		self.att_cmd.body_rate.x = x *0.01
+		self.att_cmd.body_rate.y = y *0.05
+		# if self.pole_pose < 0:
+		# 	self.att_cmd.body_rate.y = -0.1
+		# else:
+		# 	self.att_cmd.body_rate.y = 0.1
+		self.att_cmd.body_rate.z = 0
+
+		self.drone_att_pub.publish(self.att_cmd)
 
 
 	def controller(self):
 		rate = rospy.Rate(20)
-		self.goToPosition(self.hover_loc)
-		self.set_hover_mode()
+		self.goToPosition()
 
 		while not rospy.is_shutdown():
 			rate.sleep()
